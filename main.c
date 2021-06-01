@@ -28,7 +28,7 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#define usTIM	TIM4
+#define usTIM	TIM4 //timer for microsecond function
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -42,6 +42,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 
 UART_HandleTypeDef huart2;
@@ -59,21 +60,29 @@ static void MX_USART2_UART_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART6_UART_Init(void);
+static void MX_TIM3_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-void usDelay(uint32_t uSec);
+
+void usDelay(uint32_t uSec); //delay function with microsecond unit
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-uint32_t numTicks = 0;
-uint32_t state = 0;
+
+//Variables of ultrasonic sensor
+uint8_t icFlag = 0;
+uint8_t captureIdx=0;
+uint32_t edge1Time=0, edge2Time=0;
 const float speedOfSound = 0.0343/2;
 float distance;
-
-char signal;
 char uartBuf[100];
+
+//Variables of servo sensor, PIR sensor and input from NodeMCU
+uint32_t state = 0;
+char signal;
 /* USER CODE END 0 */
 
 /**
@@ -108,8 +117,9 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM2_Init();
   MX_USART6_UART_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start_IT(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start_IT(&htim2, TIM_CHANNEL_1); //Start PWM for servo
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -252,6 +262,64 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 2 */
   HAL_TIM_MspPostInit(&htim2);
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 80-1;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 1000000-1;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_IC_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_BOTHEDGE;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 4;
+  if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
 
 }
 
@@ -403,12 +471,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : ECHO_Pin */
-  GPIO_InitStruct.Pin = ECHO_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(ECHO_GPIO_Port, &GPIO_InitStruct);
-
 }
 
 /* USER CODE BEGIN 4 */
@@ -426,6 +488,7 @@ void usDelay(uint32_t uSec)
 
 void thread_ultrasonic(void const *args){
 	while(1){
+		//Set TRIG to LOW for few uSec
 		HAL_GPIO_WritePin(TRIG_GPIO_Port, TRIG_Pin, GPIO_PIN_RESET);
 		usDelay(3);
 
@@ -435,23 +498,28 @@ void thread_ultrasonic(void const *args){
 		usDelay(10);
 		HAL_GPIO_WritePin(TRIG_GPIO_Port, TRIG_Pin, GPIO_PIN_RESET);
 
-		//2. Wait for ECHO pin rising edge
-		while(HAL_GPIO_ReadPin(ECHO_GPIO_Port, ECHO_Pin) == GPIO_PIN_RESET);
+		//2. ECHO signal pulse width
 
-		//3. Start measuring ECHO pulse width in usec
-		numTicks = 0;
-		while(HAL_GPIO_ReadPin(ECHO_GPIO_Port, ECHO_Pin) == GPIO_PIN_SET)
+		//Start IC timer
+		HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
+		//Wait for IC flag
+		uint32_t startTick = HAL_GetTick();
+		do
 		{
-			numTicks++;
-			usDelay(2); //2.8usec
-		};
+			if(icFlag) break;
+		}while((HAL_GetTick() - startTick) < 500);  //500ms
+		icFlag = 0;
+		HAL_TIM_IC_Stop_IT(&htim3, TIM_CHANNEL_1);
 
-		//4. Estimate distance in cm
-		distance = (numTicks + 0.0f)*2.8*speedOfSound;
+		//Calculate distance in cm
+		if(edge2Time > edge1Time)
+		{
+			distance = ((edge2Time - edge1Time) + 0.0f)*speedOfSound;
+		}
 
-		//5. Print to UART terminal for debugging
+		//Print to UART terminal for debugging
 		sprintf(uartBuf, "%d.%d$%d$", (int)distance,((int)(distance*100))%100,state);
-		//HAL_UART_Transmit(&huart2, (uint8_t *)uartBuf, strlen(uartBuf), 100);
+		HAL_UART_Transmit(&huart2, (uint8_t *)uartBuf, strlen(uartBuf), 100);
 		HAL_UART_Transmit(&huart6, (uint8_t *)uartBuf, strlen(uartBuf), 100);
 
 		HAL_Delay(500);
@@ -461,39 +529,54 @@ void thread_ultrasonic(void const *args){
 void thread_servo(void const *args){
 	TIM2 -> CCR1 = 130;
 	while(1){
+		//signal from PIR sensor
 		if(HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_SET){
 			if(state == 0){
-				//HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-				TIM2 -> CCR1 = 35; //open
+				TIM2 -> CCR1 = 35; //open(right)
 				state = 1;
 			}else {
 				if(state == 1){
-					TIM2 -> CCR1 = 130; //close
-					//HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+					TIM2 -> CCR1 = 130; //close(left)
 					state = 0;
 				}
 			}
-			HAL_Delay(2000);
+			HAL_Delay(2000); //2 second
 			while(1){
 				if(HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET){
 					break;
 				}
 			}
 		}
+		//signal from NodeMCU
 		if (HAL_UART_Receive(&huart6, &signal, 1,100) == HAL_OK){
 			if(signal == 66){
-				TIM2 -> CCR1 = 130; //close
-				HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+				TIM2 -> CCR1 = 130; //close(left)
 				state = 0;
 			}else if(signal == 65){
-				HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-				TIM2 -> CCR1 = 35; //open
+				TIM2 -> CCR1 = 35; //open(right)
 				state = 1;
 			}
 
 		}
 	}
 }
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+		if(captureIdx == 0) //Fisrt edge
+		{
+			edge1Time = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1); //__HAL_TIM_GetCounter(&htim3);//
+
+			captureIdx = 1;
+		}
+		else if(captureIdx == 1) //Second edge
+		{
+			edge2Time = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+			captureIdx = 0;
+			icFlag = 1;
+		}
+}
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
